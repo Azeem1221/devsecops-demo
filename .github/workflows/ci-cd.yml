@@ -1,0 +1,103 @@
+name: DevSecOps CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devsecops-demo
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  gitleaks:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-scan-push:
+    name: Build, Trivy scan, Push
+    needs: [test, gitleaks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t $IMAGE_NAME:${{ github.sha }} .
+
+      - name: Trivy image scan (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Docker Hub login
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker tag $IMAGE_NAME:${{ github.sha }} $IMAGE_NAME:latest
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            docker pull ${{ env.IMAGE_NAME }}:latest
+            docker stop app || true
+            docker rm app || true
+            docker run -d --name app --restart unless-stopped -p 80:3000 ${{ env.IMAGE_NAME }}:latest
+            sleep 5
+            curl -f http://localhost/health
+
+  notify:
+    name: Slack notification
+    needs: [test, gitleaks, build-scan-push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack message
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            STATUS="Pipeline FAILED"
+          else
+            STATUS="Pipeline SUCCEEDED"
+          fi
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$STATUS | ${{ github.repository }} | branch: ${{ github.ref_name }} | by: ${{ github.actor }}\"}" \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
